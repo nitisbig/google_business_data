@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import csv
+import json
 import os
 import random
 import sys
@@ -61,6 +62,33 @@ def load_existing_keys(path):
     except Exception as exc:  # noqa: BLE001 - corrupt/old file shouldn't kill the run
         print(f"  ! could not read existing CSV ({exc}); starting fresh", file=sys.stderr)
     return keys
+
+
+def progress_path_for(out_path):
+    """Sidecar file that records which place URLs have been visited, per query."""
+    return out_path + ".progress.json"
+
+
+def load_progress(out_path):
+    """Return the progress dict {query: [visited_url, ...]} (empty if none)."""
+    path = progress_path_for(out_path)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001 - corrupt file shouldn't kill the run
+        return {}
+
+
+def save_progress(out_path, progress):
+    """Persist the progress dict (called after each listing so it's crash-safe)."""
+    try:
+        with open(progress_path_for(out_path), "w", encoding="utf-8") as f:
+            json.dump(progress, f, ensure_ascii=False, indent=0)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ! could not save progress ({exc})", file=sys.stderr)
 
 
 def open_csv_writer(path):
@@ -197,7 +225,7 @@ def extract_business(page, url, query):
     return data
 
 
-def run(query, out_path, max_results, headless):
+def run(query, out_path, max_results, headless, resume):
     search_url = force_english(
         "https://www.google.com/maps/search/" + urllib.parse.quote_plus(query)
     )
@@ -205,6 +233,14 @@ def run(query, out_path, max_results, headless):
     existing = load_existing_keys(out_path)
     csv_file, writer = open_csv_writer(out_path)
     saved = 0
+
+    # Progress: URLs already visited for this query. We always *record* progress;
+    # we only *skip* previously-visited listings when --resume is passed.
+    progress = load_progress(out_path)
+    done_before = set(progress.get(query, []))
+    visited = set(done_before)  # accumulates this run and gets persisted
+    if resume and done_before:
+        print(f"-> resume: {len(done_before)} listing(s) already visited for this query will be skipped")
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
@@ -228,23 +264,35 @@ def run(query, out_path, max_results, headless):
         print(f"-> found {len(urls)} listings; visiting each")
 
         for idx, url in enumerate(urls, 1):
+            # Resume: don't even re-open a listing we already processed.
+            if resume and url in done_before:
+                print(f"  [{idx}/{len(urls)}] resume: already visited, skipping")
+                continue
+
             data = extract_business(page, url, query)
             key = (data["name"], data["address"])
 
             if not data["name"]:
+                # Likely a transient failure -- leave it unmarked so it retries later.
                 print(f"  [{idx}/{len(urls)}] skipped (no name extracted)")
             elif key in existing:
                 print(f"  [{idx}/{len(urls)}] dup, skipping: {data['name']}")
+                visited.add(url)
             else:
                 writer.writerow(data)
                 csv_file.flush()
                 existing.add(key)
+                visited.add(url)
                 saved += 1
                 print(
                     f"  [{idx}/{len(urls)}] saved: {data['name']} | "
                     f"{data['rating'] or '-'}★ | {data['phone'] or 'no phone'} | "
                     f"{data['website'] or 'no site'}"
                 )
+
+            # Persist progress after each listing so an interrupted run can resume.
+            progress[query] = sorted(visited)
+            save_progress(out_path, progress)
 
             human_pause(0.8, 1.8)
 
@@ -269,10 +317,15 @@ def main():
     parser.add_argument("--out", default="lawyer_data.csv", help="Output CSV file")
     parser.add_argument("--max", type=int, default=40, help="Max businesses to collect")
     parser.add_argument("--headless", action="store_true", help="Run without a visible window")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip listings already visited for this query in a previous run",
+    )
     args = parser.parse_args()
 
     try:
-        run(args.query, args.out, args.max, args.headless)
+        run(args.query, args.out, args.max, args.headless, args.resume)
     except KeyboardInterrupt:
         print("\nInterrupted -- partial results were already saved.", file=sys.stderr)
         sys.exit(130)

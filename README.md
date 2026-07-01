@@ -33,16 +33,39 @@ python scrape.py "dentist in chicago" --out dentist_data.csv --max 60
 
 # run without a visible window (higher block risk, can't solve CAPTCHAs)
 python scrape.py "plumber in austin" --headless
+
+# resume an interrupted run -- skip businesses already visited for this query
+python scrape.py "lawyer in new york" --resume
 ```
 
 ### Options
 
-| Flag         | Default            | Description                                   |
-|--------------|--------------------|-----------------------------------------------|
-| `query`      | *(required)*       | Search text, e.g. `"lawyer in new york"`      |
-| `--out`      | `lawyer_data.csv`  | CSV file to append results to                 |
-| `--max`      | `40`               | Max number of businesses to collect           |
-| `--headless` | off (visible)      | Run the browser without a visible window      |
+| Flag         | Default            | Description                                              |
+|--------------|--------------------|---------------------------------------------------------|
+| `query`      | *(required)*       | Search text, e.g. `"lawyer in new york"`                |
+| `--out`      | `lawyer_data.csv`  | CSV file to append results to                           |
+| `--max`      | `40`               | Max number of businesses to collect                     |
+| `--headless` | off (visible)      | Run the browser without a visible window                |
+| `--resume`   | off                | Skip listings already visited for this query (see below)|
+
+### Resuming an interrupted run
+
+Every run records the place URLs it has visited (per query) in a sidecar file
+next to your CSV: `<out>.progress.json` (e.g. `lawyer_data.csv.progress.json`).
+This file is updated after **each** business, so it survives a crash, a CAPTCHA,
+or a `Ctrl+C`.
+
+Pass `--resume` to pick up where you left off — already-visited listings are
+skipped *without even opening them*, so the run is much faster:
+
+```bash
+python scrape.py "lawyer in new york" --max 200            # first pass (interrupt any time)
+python scrape.py "lawyer in new york" --max 200 --resume   # continues, skips what's done
+```
+
+To start a query over from scratch, delete its progress file (or the whole
+`.progress.json`). Note: resume tracking is **per query string**, so keep the
+query text identical between runs.
 
 ## Notes
 
