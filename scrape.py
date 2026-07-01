@@ -20,6 +20,7 @@ import csv
 import json
 import os
 import random
+import re
 import sys
 import time
 import urllib.parse
@@ -28,7 +29,19 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 
 # Fields written to the CSV, in order.
-CSV_FIELDS = ["name", "rating", "reviews", "phone", "website", "address", "query"]
+CSV_FIELDS = ["name", "rating", "reviews", "phone", "website", "emails", "address", "query"]
+
+# Matches most email addresses in page text/HTML.
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+# Substrings that mark an "email" as noise rather than a real contact address.
+EMAIL_JUNK = (
+    "example.com", "yourdomain", "your@email", "email@", "@sentry", "sentry.io",
+    "wixpress", "domain.com", "@2x", "@3x",
+)
+EMAIL_JUNK_SUFFIXES = (
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js",
+)
 
 # Where the browser stores cookies/consent so we don't get re-prompted each run.
 PROFILE_DIR = ".gmaps_profile"
@@ -94,6 +107,21 @@ def save_progress(out_path, progress):
 def open_csv_writer(path):
     """Open the CSV in append mode, writing the header if the file is new/empty."""
     is_new = not os.path.exists(path) or os.path.getsize(path) == 0
+    if not is_new:
+        # Warn if an existing file's header doesn't match the current columns
+        # (e.g. an old CSV from before the `emails` column was added).
+        try:
+            with open(path, "r", newline="", encoding="utf-8") as existing:
+                header = next(csv.reader(existing), [])
+            if header and header != CSV_FIELDS:
+                print(
+                    f"  ! {path} has an old/mismatched header {header}.\n"
+                    f"    New rows use columns {CSV_FIELDS}, which will misalign.\n"
+                    f"    Delete {path} to start fresh with the new columns.",
+                    file=sys.stderr,
+                )
+        except Exception:  # noqa: BLE001
+            pass
     f = open(path, "a", newline="", encoding="utf-8")
     writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
     if is_new:
@@ -181,6 +209,98 @@ def _attr_or_blank(page, selector, attr, timeout=2500):
         return ""
 
 
+def clean_emails(candidates):
+    """Lowercase, dedupe (order-preserving) and drop junk/asset false positives."""
+    seen = []
+    seen_set = set()
+    for raw in candidates:
+        email = (raw or "").strip().strip(".,;:").lower()
+        if not email or "@" not in email:
+            continue
+        if email.endswith(EMAIL_JUNK_SUFFIXES):
+            continue
+        if any(junk in email for junk in EMAIL_JUNK):
+            continue
+        if email not in seen_set:
+            seen_set.add(email)
+            seen.append(email)
+    return seen
+
+
+def _emails_on_page(page):
+    """Collect email candidates from mailto links + a regex over the page HTML."""
+    found = []
+    # mailto: links are the most reliable signal
+    try:
+        links = page.locator('a[href^="mailto:"]')
+        for i in range(links.count()):
+            href = links.nth(i).get_attribute("href") or ""
+            addr = href.split("mailto:", 1)[-1].split("?", 1)[0]
+            addr = urllib.parse.unquote(addr).strip()
+            if addr:
+                found.append(addr)
+    except Exception:  # noqa: BLE001
+        pass
+    # regex over the rendered HTML catches plain-text addresses
+    try:
+        found.extend(EMAIL_RE.findall(page.content()))
+    except Exception:  # noqa: BLE001
+        pass
+    return found
+
+
+# Give JS a moment to inject mailto links / text emails after DOM load.
+EMAIL_SETTLE_MS = 1400
+# How many Contact/About pages to try if the homepage has no email.
+EMAIL_FALLBACK_PAGES = 2
+
+
+def _load_and_scan(email_page, url, timeout_ms):
+    """Navigate to url, wait for JS to settle, and return cleaned emails. Never raises."""
+    try:
+        email_page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        email_page.wait_for_timeout(EMAIL_SETTLE_MS)
+    except Exception:  # noqa: BLE001 - dead/slow/blocking site shouldn't stop the run
+        return []
+    return clean_emails(_emails_on_page(email_page))
+
+
+def extract_emails(email_page, website, timeout_ms):
+    """Visit a business website and return ';'-joined contact emails. Never raises.
+
+    Scans the homepage; if nothing is found, follows Contact (then About) links
+    and scans those too, up to EMAIL_FALLBACK_PAGES pages.
+    """
+    if not website:
+        return ""
+
+    emails = _load_and_scan(email_page, website, timeout_ms)
+    if emails:
+        return ";".join(emails)
+
+    # Fallback: collect Contact-first, then About links from the homepage, and
+    # visit a couple of them looking for a published address.
+    try:
+        targets = []
+        for selector in ('a[href*="contact" i]', 'a[href*="about" i]'):
+            links = email_page.locator(selector)
+            for i in range(min(links.count(), 3)):
+                href = links.nth(i).get_attribute("href")
+                if href:
+                    resolved = urllib.parse.urljoin(email_page.url, href)
+                    if resolved not in targets:
+                        targets.append(resolved)
+    except Exception:  # noqa: BLE001
+        targets = []
+
+    for target in targets[:EMAIL_FALLBACK_PAGES]:
+        emails = _load_and_scan(email_page, target, timeout_ms)
+        if emails:
+            break
+
+    return ";".join(emails)
+
+
 def extract_business(page, url, query):
     """Open a place URL and pull the fields we care about. Never raises."""
     data = {field: "" for field in CSV_FIELDS}
@@ -225,7 +345,7 @@ def extract_business(page, url, query):
     return data
 
 
-def run(query, out_path, max_results, headless, resume):
+def run(query, out_path, max_results, headless, resume, extract_email_flag, email_timeout):
     search_url = force_english(
         "https://www.google.com/maps/search/" + urllib.parse.quote_plus(query)
     )
@@ -254,6 +374,18 @@ def run(query, out_path, max_results, headless, resume):
         )
         page = context.pages[0] if context.pages else context.new_page()
 
+        # Dedicated tab for visiting business websites, so the Maps page state is
+        # untouched. Block heavy resources -- we only need the HTML/mailto links.
+        email_page = None
+        if extract_email_flag:
+            email_page = context.new_page()
+            email_page.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in {"image", "media", "font"}
+                else route.continue_(),
+            )
+
         print(f"-> searching Google Maps for: {query}")
         page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
         dismiss_consent(page)
@@ -279,6 +411,10 @@ def run(query, out_path, max_results, headless, resume):
                 print(f"  [{idx}/{len(urls)}] dup, skipping: {data['name']}")
                 visited.add(url)
             else:
+                # Visit the business website to pull contact email(s).
+                if email_page is not None and data["website"]:
+                    data["emails"] = extract_emails(email_page, data["website"], email_timeout)
+
                 writer.writerow(data)
                 csv_file.flush()
                 existing.add(key)
@@ -287,7 +423,8 @@ def run(query, out_path, max_results, headless, resume):
                 print(
                     f"  [{idx}/{len(urls)}] saved: {data['name']} | "
                     f"{data['rating'] or '-'}★ | {data['phone'] or 'no phone'} | "
-                    f"{data['website'] or 'no site'}"
+                    f"{data['website'] or 'no site'} | "
+                    f"{data['emails'] or 'no email'}"
                 )
 
             # Persist progress after each listing so an interrupted run can resume.
@@ -296,6 +433,8 @@ def run(query, out_path, max_results, headless, resume):
 
             human_pause(0.8, 1.8)
 
+        if email_page is not None:
+            email_page.close()
         context.close()
 
     csv_file.close()
@@ -322,10 +461,29 @@ def main():
         action="store_true",
         help="Skip listings already visited for this query in a previous run",
     )
+    parser.add_argument(
+        "--no-emails",
+        action="store_true",
+        help="Don't visit business websites to extract emails (faster, Maps data only)",
+    )
+    parser.add_argument(
+        "--email-timeout",
+        type=int,
+        default=15000,
+        help="Per-page timeout in ms when visiting business websites (default 15000)",
+    )
     args = parser.parse_args()
 
     try:
-        run(args.query, args.out, args.max, args.headless, args.resume)
+        run(
+            args.query,
+            args.out,
+            args.max,
+            args.headless,
+            args.resume,
+            not args.no_emails,
+            args.email_timeout,
+        )
     except KeyboardInterrupt:
         print("\nInterrupted -- partial results were already saved.", file=sys.stderr)
         sys.exit(130)

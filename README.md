@@ -2,7 +2,11 @@
 
 A small command-line tool that scrapes business listings from **Google Maps**
 for a given search query and appends the results — **name, rating, reviews,
-phone, website, address** — to a CSV file.
+phone, website, emails, address** — to a CSV file.
+
+For each business that has a website, the tool also **visits that site and pulls
+contact email(s)** — scanning the homepage and, if needed, one Contact/About
+page. This is on by default (use `--no-emails` to skip).
 
 It uses a real Chromium browser (via Playwright) because Google renders its data
 with JavaScript and blocks plain HTTP clients. No AI is used — the flow is a
@@ -36,17 +40,35 @@ python scrape.py "plumber in austin" --headless
 
 # resume an interrupted run -- skip businesses already visited for this query
 python scrape.py "lawyer in new york" --resume
+
+# skip email extraction -> much faster, only Google Maps data
+python scrape.py "lawyer in new york" --no-emails
 ```
 
 ### Options
 
-| Flag         | Default            | Description                                              |
-|--------------|--------------------|---------------------------------------------------------|
-| `query`      | *(required)*       | Search text, e.g. `"lawyer in new york"`                |
-| `--out`      | `lawyer_data.csv`  | CSV file to append results to                           |
-| `--max`      | `40`               | Max number of businesses to collect                     |
-| `--headless` | off (visible)      | Run the browser without a visible window                |
-| `--resume`   | off                | Skip listings already visited for this query (see below)|
+| Flag              | Default            | Description                                              |
+|-------------------|--------------------|---------------------------------------------------------|
+| `query`           | *(required)*       | Search text, e.g. `"lawyer in new york"`                |
+| `--out`           | `lawyer_data.csv`  | CSV file to append results to                           |
+| `--max`           | `40`               | Max number of businesses to collect                     |
+| `--headless`      | off (visible)      | Run the browser without a visible window                |
+| `--resume`        | off                | Skip listings already visited for this query (see below)|
+| `--no-emails`     | off (emails on)    | Don't visit business websites to extract emails         |
+| `--email-timeout` | `15000`            | Per-site timeout in ms when extracting emails           |
+
+### Email extraction
+
+By default, for every business that lists a website, the tool opens that site in
+a second browser tab and looks for contact email(s): it scans the homepage and,
+if none are found, follows one **Contact/About** link and scans that page too.
+Multiple emails are joined with `;` in the `emails` column. Images/fonts are
+blocked on this tab to keep it fast. Use `--no-emails` to turn this off.
+
+> **New `emails` column:** a CSV created before this feature won't have the
+> `emails` header. Delete the old file (the tool recreates it with the new
+> columns) or new rows will misalign — the tool prints a warning if it detects a
+> mismatched header.
 
 ### Resuming an interrupted run
 
